@@ -275,4 +275,4 @@ Resolve a pending approval before sending another message on the same conversati
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+MIT
