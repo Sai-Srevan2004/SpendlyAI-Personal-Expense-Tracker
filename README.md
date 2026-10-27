@@ -32,12 +32,6 @@ Spendly AI is an AI-powered personal finance tracker that helps users manage exp
 ### Frontend
 - React
 - Vite
-- JavaScript
-- CSS
-- React Markdown
-- remark-gfm
-- lucide-react
-- Recharts (for dashboard charts)
 
 ## Project Structure
 
