@@ -5,6 +5,8 @@ from app.schemas.intent import TransactionItem
 
 from langgraph.types import interrupt
 
+from datetime import date
+
 from app.tools.transaction_store import (
     get_transaction_summary,
     add_transactions,
@@ -46,6 +48,47 @@ def validate_batch(transactions: list[dict]) -> list[TransactionItem]:
 
     return items
 
+
+def validate_transaction_update(
+    amount: float | None = None,
+    category: str | None = None,
+    description: str | None = None,
+) -> str | None:
+    """Validate supplied transaction update fields."""
+
+    if amount is not None and amount <= 0:
+        return "Amount must be greater than zero."
+
+    if category is not None and not category.strip():
+        return "Category cannot be empty."
+
+    if description is not None and not description.strip():
+        return "Description cannot be empty."
+
+    return None
+
+def validate_transaction_date(
+    transaction_date: str | None,
+) -> str | None:
+    """Validate supported transaction date formats."""
+
+    if transaction_date is None:
+        return None
+
+    normalized_date = transaction_date.strip().lower()
+
+    if normalized_date in {"today", "yesterday", "tomorrow"}:
+        return None
+
+    try:
+        date.fromisoformat(normalized_date)
+    except (ValueError, TypeError):
+        return (
+            "Invalid transaction date. Use YYYY-MM-DD, "
+            "today, yesterday, or tomorrow."
+        )
+
+    return None
 
 @tool
 def record_expenses(transactions: list[dict]) -> dict:
@@ -148,6 +191,28 @@ def update_transaction_tool(
             "success": False,
             "error": "Provide at least one field to update.",
         }
+
+    
+    validation_error = validate_transaction_update(
+        amount=amount,
+        category=category,
+        description=description,
+    )
+
+    if validation_error:
+        return {
+            "success": False,
+            "error": validation_error,
+        }
+
+    date_error = validate_transaction_date(transaction_date)
+
+    if date_error:
+        return {
+            "success": False,
+            "error": date_error,
+        }
+
 
     transactions = list_transactions()
     existing = next(

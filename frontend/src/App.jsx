@@ -71,6 +71,33 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
+  const [dashboard, setDashboard] = useState(null);
+  const [dashboardLoading, setDashboardLoading] = useState(true);
+  const [dashboardError, setDashboardError] = useState("");
+
+  async function loadDashboard() {
+    try {
+      setDashboardError("");
+
+      const response = await fetch(`${API_URL}/dashboard/summary`);
+
+      if (!response.ok) {
+        throw new Error("Failed to load dashboard data.");
+      }
+
+      const data = await response.json();
+      setDashboard(data);
+    } catch (error) {
+      setDashboardError(error.message);
+    } finally {
+      setDashboardLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadDashboard();
+  }, []);
+
   // Save the current conversation whenever its state changes.
   useEffect(() => {
     try {
@@ -294,6 +321,55 @@ function App() {
               </p>
             </div>
           </div>
+
+          <section className="dashboard-section">
+            <div className="dashboard-heading">
+              <div>
+                <h2>Financial Overview</h2>
+                <p>Your personal finances at a glance</p>
+              </div>
+            </div>
+
+            {dashboardLoading ? (
+              <p>Loading your financial overview...</p>
+            ) : dashboardError ? (
+              <p className="dashboard-error">{dashboardError}</p>
+            ) : dashboard ? (
+              <div className="dashboard-grid">
+                <div className="dashboard-card">
+                  <span>Current Balance</span>
+                  <h3>
+                    ₹{Number(dashboard.balance).toLocaleString("en-IN", {
+                      maximumFractionDigits: 2,
+                    })}
+                  </h3>
+                </div>
+
+                <div className="dashboard-card">
+                  <span>Monthly Income</span>
+                  <h3 className="income-value">
+                    +₹{Number(dashboard.monthly_income).toLocaleString("en-IN", {
+                      maximumFractionDigits: 2,
+                    })}
+                  </h3>
+                </div>
+
+                <div className="dashboard-card">
+                  <span>Monthly Expenses</span>
+                  <h3 className="expense-value">
+                    -₹{Number(dashboard.monthly_expenses).toLocaleString("en-IN", {
+                      maximumFractionDigits: 2,
+                    })}
+                  </h3>
+                </div>
+
+                <div className="dashboard-card">
+                  <span>Transactions This Month</span>
+                  <h3>{dashboard.monthly_transaction_count}</h3>
+                </div>
+              </div>
+            ) : null}
+          </section>
 
           <div className="messages">
             {messages.map((message, index) => (
