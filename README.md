@@ -275,4 +275,4 @@ Resolve a pending approval before sending another message on the same conversati
 
 ## License
 
-No license has been specified yet. Add a `LICENSE` file before distributing the project under an open-source license.
+This project is licensed under the [MIT License](LICENSE).
