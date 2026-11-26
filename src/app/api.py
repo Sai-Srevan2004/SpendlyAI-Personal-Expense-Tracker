@@ -1,26 +1,33 @@
 
 import os
-import uuid
 from contextlib import asynccontextmanager
 from datetime import date
 
 import pymysql
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.mysql.pymysql import PyMySQLSaver
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from app.ai.graph import build_graph
+from app.auth.dependencies import get_current_user
+from app.auth.routes import router as auth_router
+from app.database import get_db
+from app.models.user import User
+from app.models.conversation import Conversation
+from app.tools.conversation_store import get_or_create_conversation
+
 from app.tools.transaction_store import (
     get_balance,
     get_category_summary,
     get_transaction_summary,
     list_transactions,
 )
-
+import traceback
 
 load_dotenv(override=True)
 
@@ -41,6 +48,7 @@ def get_mysql_connection():
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
         connect_timeout=10,
+        init_command="SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci",
     )
 
 
@@ -84,6 +92,9 @@ app = FastAPI(
 )
 
 
+app.include_router(auth_router)
+
+
 # ------------------------------------------------------------------
 # CORS
 # ------------------------------------------------------------------
@@ -99,10 +110,13 @@ allowed_origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -112,11 +126,9 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=5000)
-    thread_id: str | None = None
 
 
 class ApprovalRequest(BaseModel):
-    thread_id: str = Field(min_length=1, max_length=200)
     approved: bool
 
 
@@ -131,8 +143,12 @@ class ChatResponse(BaseModel):
 # Graph execution
 # ------------------------------------------------------------------
 
-def invoke_graph(thread_id: str, graph_input: dict | Command) -> dict:
-    """Run the graph using a fresh MySQL connection."""
+def invoke_graph(
+    thread_id: str,
+    graph_input: dict | Command,
+    user_id: int,
+) -> dict:
+    """Run the graph with authenticated user context."""
     connection = get_mysql_connection()
 
     try:
@@ -145,7 +161,13 @@ def invoke_graph(thread_id: str, graph_input: dict | Command) -> dict:
             }
         }
 
-        return graph.invoke(graph_input, config=config)
+        return graph.invoke(
+            graph_input,
+            config=config,
+            context={
+                "user_id": user_id,
+            },
+        )
 
     finally:
         connection.close()
@@ -177,8 +199,33 @@ def has_pending_approval(thread_id: str) -> bool:
 # Graph result formatting
 # ------------------------------------------------------------------
 
+def extract_message_text(content) -> str:
+    """Extract readable text from LangChain message content."""
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        text_parts = []
+
+        for block in content:
+            if isinstance(block, str):
+                text_parts.append(block)
+
+            elif isinstance(block, dict):
+                if block.get("type") == "text":
+                    text = block.get("text", "")
+                    if isinstance(text, str):
+                        text_parts.append(text)
+
+        return "\n".join(text_parts).strip()
+
+    return ""
+
+
 def format_result(result: dict, thread_id: str) -> ChatResponse:
-    """Convert a graph result into the frontend response format."""
+    """Convert the final graph response into the API response."""
+
     interrupts = result.get("__interrupt__", [])
 
     if interrupts:
@@ -195,15 +242,29 @@ def format_result(result: dict, thread_id: str) -> ChatResponse:
         )
 
     messages = result.get("messages", [])
-    content = messages[-1].content if messages else ""
 
-    if not isinstance(content, str):
-        content = str(content)
+    # Find the latest assistant message containing a final response.
+    for message in reversed(messages):
+        if not isinstance(message, AIMessage):
+            continue
+
+        # Skip intermediate tool-call messages.
+        if message.tool_calls:
+            continue
+
+        content = extract_message_text(message.content)
+
+        if content:
+            return ChatResponse(
+                response=content,
+                thread_id=thread_id,
+            )
 
     return ChatResponse(
-        response=content,
+        response="I couldn't generate a response. Please try again.",
         thread_id=thread_id,
     )
+
 
 
 # ------------------------------------------------------------------
@@ -221,9 +282,12 @@ def health_check() -> dict:
 # ------------------------------------------------------------------
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
-    """Process a chat message and return the assistant response."""
-    thread_id = request.thread_id or str(uuid.uuid4())
+def chat(
+    request: ChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ChatResponse:
+    """Process a chat message for the authenticated user."""
 
     if not request.message.strip():
         raise HTTPException(
@@ -231,24 +295,29 @@ def chat(request: ChatRequest) -> ChatResponse:
             detail="Message cannot be empty.",
         )
 
+    thread_id = get_or_create_conversation(
+        db=db,
+        user_id=current_user.id,
+    )
+
     try:
         if has_pending_approval(thread_id):
             raise HTTPException(
                 status_code=409,
                 detail=(
                     "This conversation has a pending approval. "
-                    "Please approve or reject it using /approval "
-                    "before sending another message."
+                    "Please resolve it before sending another message."
                 ),
             )
 
         result = invoke_graph(
-            thread_id,
-            {
+            thread_id=thread_id,
+            graph_input={
                 "messages": [
                     HumanMessage(content=request.message)
                 ]
             },
+            user_id=current_user.id,
         )
 
         return format_result(result, thread_id)
@@ -258,16 +327,15 @@ def chat(request: ChatRequest) -> ChatResponse:
 
     except Exception as error:
         print(
-            f"Chat request failed for thread_id={thread_id}: "
+            f"Chat request failed for user_id={current_user.id}: "
             f"{type(error).__name__}: {error}"
         )
 
+        traceback.print_exc()
+
         raise HTTPException(
             status_code=500,
-            detail=(
-                "The chat request could not be completed. "
-                "Please try again."
-            ),
+            detail="The chat request could not be completed.",
         ) from None
 
 
@@ -276,33 +344,43 @@ def chat(request: ChatRequest) -> ChatResponse:
 # ------------------------------------------------------------------
 
 @app.get("/dashboard/summary")
-def dashboard_summary() -> dict:
-    """Return financial summaries for the current month."""
+def dashboard_summary(
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Return financial summaries for the authenticated user."""
+
     try:
+        user_id = current_user.id
+
         today = date.today()
         month_start = today.replace(day=1).isoformat()
         today_str = today.isoformat()
 
-        balance = get_balance()
+        balance = get_balance(user_id)
 
         income = get_transaction_summary(
+            user_id=user_id,
             transaction_type="income",
             start_date=month_start,
             end_date=today_str,
         )
 
         expenses = get_transaction_summary(
+            user_id=user_id,
             transaction_type="expense",
             start_date=month_start,
             end_date=today_str,
         )
 
         categories = get_category_summary(
+            user_id=user_id,
             start_date=month_start,
             end_date=today_str,
         )
 
-        recent_transactions = list_transactions()[:5]
+        recent_transactions = list_transactions(
+            user_id=user_id,
+        )[:5]
 
         return {
             "balance": balance,
@@ -321,16 +399,13 @@ def dashboard_summary() -> dict:
 
     except Exception as error:
         print(
-            f"Dashboard summary request failed: "
+            f"Dashboard summary failed for user_id={current_user.id}: "
             f"{type(error).__name__}: {error}"
         )
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                "The dashboard summary could not be loaded. "
-                "Please try again."
-            ),
+            detail="The dashboard summary could not be loaded.",
         ) from None
 
 
@@ -339,42 +414,56 @@ def dashboard_summary() -> dict:
 # ------------------------------------------------------------------
 
 @app.post("/approval", response_model=ChatResponse)
-def handle_approval(request: ApprovalRequest) -> ChatResponse:
-    """Resume a graph execution with the user's approval decision."""
+def handle_approval(
+    request: ApprovalRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ChatResponse:
+    """Resume only the authenticated user's conversation."""
+
+    conversation = (
+        db.query(Conversation)
+        .filter(Conversation.user_id == current_user.id)
+        .first()
+    )
+
+    if not conversation:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found.",
+        )
+
+    thread_id = conversation.thread_id
+
     try:
-        if not has_pending_approval(request.thread_id):
+        if not has_pending_approval(thread_id):
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "This conversation has no pending approval "
-                    "to process."
-                ),
+                detail="This conversation has no pending approval.",
             )
 
         result = invoke_graph(
-            request.thread_id,
-            Command(
+            thread_id=thread_id,
+            graph_input=Command(
                 resume={
                     "approved": request.approved,
                 }
             ),
+            user_id=current_user.id,
         )
 
-        return format_result(result, request.thread_id)
+        return format_result(result, thread_id)
 
     except HTTPException:
         raise
 
     except Exception as error:
         print(
-            f"Approval request failed for thread_id={request.thread_id}: "
+            f"Approval request failed for user_id={current_user.id}: "
             f"{type(error).__name__}: {error}"
         )
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                "The approval request could not be completed. "
-                "Please try again."
-            ),
+            detail="The approval request could not be completed.",
         ) from None

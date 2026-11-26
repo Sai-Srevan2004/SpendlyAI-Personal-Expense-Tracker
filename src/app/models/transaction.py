@@ -2,8 +2,16 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, Numeric, String, Text, func
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import (
+    Date,
+    DateTime,
+    ForeignKey,
+    Numeric,
+    String,
+    Text,
+    func,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
@@ -14,6 +22,12 @@ class Transaction(Base):
     id: Mapped[str] = mapped_column(
         String(36),
         primary_key=True,
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
 
     type: Mapped[str] = mapped_column(
@@ -45,4 +59,8 @@ class Transaction(Base):
         DateTime,
         server_default=func.now(),
         nullable=False,
+    )
+
+    user: Mapped["User"] = relationship(
+        back_populates="transactions",
     )

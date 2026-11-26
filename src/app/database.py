@@ -9,11 +9,11 @@ load_dotenv()
 
 DATABASE_URL = URL.create(
     drivername="mysql+pymysql",
-    username=os.getenv("DB_USER", "root"),
-    password=os.getenv("DB_PASSWORD", ""),
-    host=os.getenv("DB_HOST", "localhost"),
-    port=int(os.getenv("DB_PORT", "3306")),
-    database=os.getenv("DB_NAME", "ai_expense_tracker"),
+    username=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD"),
+    host=os.getenv("DB_HOST"),
+    port=int(os.getenv("DB_PORT")),
+    database=os.getenv("DB_NAME"),
 )
 
 engine = create_engine(
@@ -31,3 +31,15 @@ SessionLocal = sessionmaker(
 class Base(DeclarativeBase):
     """Base class for SQLAlchemy models."""
     pass
+
+
+
+
+def get_db():
+    """Provide a database session for each request."""
+    db = SessionLocal()
+
+    try:
+        yield db
+    finally:
+        db.close()

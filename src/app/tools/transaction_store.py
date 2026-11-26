@@ -1,7 +1,8 @@
 
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from uuid import uuid4
+
 from sqlalchemy import delete, func, select
 
 from app.database import SessionLocal
@@ -9,11 +10,12 @@ from app.models.transaction import Transaction
 from app.schemas.intent import TransactionItem
 
 
-def parse_transaction_date(value: str | None) -> date:
-    """Convert a supported date string into a Python date."""
 
-    if not value:
-        return date.today()
+def parse_transaction_date(value: str | None) -> date:
+    """Parse a date explicitly provided for a transaction."""
+
+    if value is None or not value.strip():
+        raise ValueError("Transaction date is required.")
 
     normalized = value.strip().lower()
 
@@ -27,17 +29,21 @@ def parse_transaction_date(value: str | None) -> date:
         return relative_dates[normalized]
 
     try:
-        return date.fromisoformat(normalized)
+        parsed = date.fromisoformat(normalized)
+
+        if parsed.isoformat() != normalized:
+            raise ValueError
+
+        return parsed
+
     except ValueError as error:
         raise ValueError(
-            "Unsupported date. Use YYYY-MM-DD, today, yesterday, "
-            "or tomorrow."
+            "Invalid date. Use YYYY-MM-DD, today, yesterday, or tomorrow."
         ) from error
 
 
-def transaction_to_dict(transaction: Transaction) -> dict:
-    """Convert a database transaction into a dictionary."""
 
+def transaction_to_dict(transaction: Transaction) -> dict:
     return {
         "id": transaction.id,
         "type": transaction.type,
@@ -49,60 +55,56 @@ def transaction_to_dict(transaction: Transaction) -> dict:
 
 
 def add_transactions(
+    user_id: int,
     items: list[TransactionItem],
     transaction_type: str,
 ) -> list[dict]:
-    """Save multiple transactions to MySQL."""
-
     if transaction_type not in {"expense", "income"}:
         raise ValueError("Invalid transaction type.")
 
     if not items:
         raise ValueError("At least one transaction is required.")
 
-    new_transactions = []
+    transactions = []
 
-    # Validate and prepare the complete batch before saving.
     for item in items:
-        if item.amount is None or item.amount <= 0:
-            raise ValueError(
-                "Every transaction needs a positive amount."
-            )
+        try:
+            amount = Decimal(str(item.amount))
+        except (InvalidOperation, ValueError, TypeError) as error:
+            raise ValueError("Amount must be a valid number.") from error
 
-        if not item.category:
-            raise ValueError(
-                "Every transaction needs a category."
-            )
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError("Amount must be a finite positive number.")
+
+        if not item.category or not item.category.strip():
+            raise ValueError("Category cannot be empty.")
 
         if not item.description or not item.description.strip():
-            raise ValueError(
-                "Every transaction needs a description."
-            )
+            raise ValueError("Description cannot be empty.")
 
-        transaction = Transaction(
-            id=str(uuid4()),
-            type=transaction_type,
-            amount=Decimal(str(item.amount)),
-            category=item.category,
-            description=item.description.strip(),
-            transaction_date=parse_transaction_date(
-                item.transaction_date
-            ),
+        transactions.append(
+            Transaction(
+                id=str(uuid4()),
+                user_id=user_id,
+                type=transaction_type,
+                amount=amount,
+                category=item.category.strip(),
+                description=item.description.strip(),
+                transaction_date=parse_transaction_date(
+                    item.transaction_date
+                ),
+            )
         )
 
-        new_transactions.append(transaction)
-
-    # Save the complete batch in one database transaction.
     with SessionLocal() as session:
         try:
-            session.add_all(new_transactions)
+            session.add_all(transactions)
             session.commit()
 
             return [
                 transaction_to_dict(transaction)
-                for transaction in new_transactions
+                for transaction in transactions
             ]
-
         except Exception:
             session.rollback()
             raise
@@ -111,7 +113,6 @@ def add_transactions(
 def resolve_date_range(
     date_filter: str | None,
 ) -> tuple[date | None, date | None]:
-    """Convert common date filters into a start and end date."""
     if not date_filter:
         return None, None
 
@@ -126,25 +127,20 @@ def resolve_date_range(
         return yesterday, yesterday
 
     if value == "this month":
-        start = today.replace(day=1)
-        return start, today
+        return today.replace(day=1), today
 
     if value == "last month":
         end = today.replace(day=1) - timedelta(days=1)
-        start = end.replace(day=1)
-        return start, end
+        return end.replace(day=1), end
 
     if value == "this week":
         start = today - timedelta(days=today.weekday())
-        end = start + timedelta(days=6)
-        return start, end
+        return start, start + timedelta(days=6)
 
     if value == "last week":
         this_week_start = today - timedelta(days=today.weekday())
         end = this_week_start - timedelta(days=1)
-        start = end - timedelta(days=6)
-        return start, end
-
+        return end - timedelta(days=6), end
 
     raise ValueError(
         "Unsupported date filter. Use today, yesterday, this week, "
@@ -152,25 +148,73 @@ def resolve_date_range(
     )
 
 
+def get_date_bounds(
+    date_filter: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> tuple[date | None, date | None]:
+    filter_start, filter_end = resolve_date_range(date_filter)
+
+    def parse_custom_date(value: str) -> date:
+        try:
+            normalized = value.strip()
+            parsed = date.fromisoformat(normalized)
+
+            if parsed.isoformat() != normalized:
+                raise ValueError
+
+            return parsed
+        except (ValueError, AttributeError) as error:
+            raise ValueError(
+                "Invalid date. Use YYYY-MM-DD format."
+            ) from error
+
+    if start_date:
+        filter_start = parse_custom_date(start_date)
+
+    if end_date:
+        filter_end = parse_custom_date(end_date)
+
+    if filter_start and filter_end and filter_start > filter_end:
+        raise ValueError("Start date cannot be later than end date.")
+
+    return filter_start, filter_end
+
+
+def apply_date_filters(
+    statement,
+    filter_start: date | None,
+    filter_end: date | None,
+):
+    if filter_start:
+        statement = statement.where(
+            Transaction.transaction_date >= filter_start
+        )
+
+    if filter_end:
+        statement = statement.where(
+            Transaction.transaction_date <= filter_end
+        )
+
+    return statement
+
 
 def list_transactions(
+    user_id: int,
     transaction_type: str | None = None,
     category: str | None = None,
     date_filter: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> list[dict]:
-    """Retrieve transactions using optional filters."""
-    filter_start, filter_end = resolve_date_range(date_filter)
-
-    if start_date:
-        filter_start = date.fromisoformat(start_date)
-
-    if end_date:
-        filter_end = date.fromisoformat(end_date)
+    filter_start, filter_end = get_date_bounds(
+        date_filter, start_date, end_date
+    )
 
     with SessionLocal() as session:
-        statement = select(Transaction)
+        statement = select(Transaction).where(
+            Transaction.user_id == user_id
+        )
 
         if transaction_type:
             statement = statement.where(
@@ -179,78 +223,104 @@ def list_transactions(
 
         if category:
             statement = statement.where(
-                func.lower(Transaction.category) == category.strip().lower()
+                func.lower(Transaction.category)
+                == category.strip().lower()
             )
 
-        if filter_start:
-            statement = statement.where(
-                Transaction.transaction_date >= filter_start
-            )
+        statement = apply_date_filters(
+            statement, filter_start, filter_end
+        )
 
-        if filter_end:
-            statement = statement.where(
-                Transaction.transaction_date <= filter_end
-            )
+        statement = statement.order_by(
+            Transaction.created_at.desc()
+        )
 
-        statement = statement.order_by(Transaction.created_at.desc())
         transactions = session.scalars(statement).all()
 
-        return [transaction_to_dict(item) for item in transactions]
+        return [
+            transaction_to_dict(transaction)
+            for transaction in transactions
+        ]
 
 
-def get_balance() -> float:
-    """Calculate total income minus total expenses from MySQL."""
+def get_transaction(
+    user_id: int,
+    transaction_id: str,
+) -> dict | None:
+    with SessionLocal() as session:
+        transaction = session.scalar(
+            select(Transaction).where(
+                Transaction.id == transaction_id,
+                Transaction.user_id == user_id,
+            )
+        )
 
+        if transaction is None:
+            return None
+
+        return transaction_to_dict(transaction)
+
+
+def get_balance(user_id: int) -> float:
     with SessionLocal() as session:
         income = session.scalar(
-            select(
-                func.coalesce(func.sum(Transaction.amount), 0)
-            ).where(Transaction.type == "income")
+            select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+                Transaction.user_id == user_id,
+                Transaction.type == "income",
+            )
         )
 
         expenses = session.scalar(
-            select(
-                func.coalesce(func.sum(Transaction.amount), 0)
-            ).where(Transaction.type == "expense")
+            select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+                Transaction.user_id == user_id,
+                Transaction.type == "expense",
+            )
         )
 
-        balance = Decimal(str(income)) - Decimal(str(expenses))
-
-        return float(balance)
+        return float(Decimal(str(income)) - Decimal(str(expenses)))
 
 
 def update_transaction(
+    user_id: int,
     transaction_id: str,
     amount: float | None = None,
     category: str | None = None,
     description: str | None = None,
     transaction_date: str | None = None,
 ) -> dict | None:
-    """Update an existing transaction by its ID."""
-
     with SessionLocal() as session:
         try:
-            transaction = session.get(Transaction, transaction_id)
+            transaction = session.scalar(
+                select(Transaction).where(
+                    Transaction.id == transaction_id,
+                    Transaction.user_id == user_id,
+                )
+            )
 
             if transaction is None:
                 return None
 
             if amount is not None:
-                if amount <= 0:
-                    raise ValueError("Amount must be positive.")
+                try:
+                    parsed_amount = Decimal(str(amount))
+                except (InvalidOperation, ValueError, TypeError) as error:
+                    raise ValueError("Invalid amount.") from error
 
-                transaction.amount = Decimal(str(amount))
+                if not parsed_amount.is_finite() or parsed_amount <= 0:
+                    raise ValueError(
+                        "Amount must be a finite positive number."
+                    )
+
+                transaction.amount = parsed_amount
 
             if category is not None:
                 if not category.strip():
                     raise ValueError("Category cannot be empty.")
-
-                transaction.category = category
+                transaction.category = category.strip()
 
             if description is not None:
                 if not description.strip():
                     raise ValueError("Description cannot be empty.")
-
                 transaction.description = description.strip()
 
             if transaction_date is not None:
@@ -268,72 +338,71 @@ def update_transaction(
             raise
 
 
-def delete_transaction(transaction_id: str) -> dict | None:
-    """Delete an existing transaction by its ID."""
-
+def delete_transaction(
+    user_id: int,
+    transaction_id: str,
+) -> dict | None:
     with SessionLocal() as session:
         try:
-            transaction = session.get(Transaction, transaction_id)
+            transaction = session.scalar(
+                select(Transaction).where(
+                    Transaction.id == transaction_id,
+                    Transaction.user_id == user_id,
+                )
+            )
 
             if transaction is None:
                 return None
 
-            deleted_transaction = transaction_to_dict(transaction)
+            result = transaction_to_dict(transaction)
 
             session.delete(transaction)
             session.commit()
 
-            return deleted_transaction
+            return result
 
         except Exception:
             session.rollback()
             raise
 
 
-
-def clear_transactions() -> None:
-    """Delete all transactions. Use only when intentionally resetting data."""
-
+def clear_transactions(user_id: int) -> None:
     with SessionLocal() as session:
         try:
-            session.execute(delete(Transaction))
+            session.execute(
+                delete(Transaction).where(
+                    Transaction.user_id == user_id
+                )
+            )
             session.commit()
         except Exception:
             session.rollback()
             raise
 
 
-
 def get_transaction_summary(
+    user_id: int,
     transaction_type: str = "expense",
     date_filter: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict:
-    """Calculate transaction totals and counts for a date range."""
-    filter_start, filter_end = resolve_date_range(date_filter)
-
-    if start_date:
-        filter_start = date.fromisoformat(start_date)
-
-    if end_date:
-        filter_end = date.fromisoformat(end_date)
+    filter_start, filter_end = get_date_bounds(
+        date_filter, start_date, end_date
+    )
 
     with SessionLocal() as session:
         statement = select(
             func.coalesce(func.sum(Transaction.amount), 0),
             func.count(Transaction.id),
-        ).where(Transaction.type == transaction_type)
+        ).where(
+            Transaction.user_id == user_id,
+            Transaction.type == transaction_type,
+        )
 
-        if filter_start:
-            statement = statement.where(
-                Transaction.transaction_date >= filter_start
-            )
-
-        if filter_end:
-            statement = statement.where(
-                Transaction.transaction_date <= filter_end
-            )
+        statement = apply_date_filters(
+            statement, filter_start, filter_end
+        )
 
         total, count = session.execute(statement).one()
 
@@ -344,24 +413,21 @@ def get_transaction_summary(
             "start_date": (
                 filter_start.isoformat() if filter_start else None
             ),
-            "end_date": filter_end.isoformat() if filter_end else None,
+            "end_date": (
+                filter_end.isoformat() if filter_end else None
+            ),
         }
 
 
-
 def get_category_summary(
+    user_id: int,
     date_filter: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> list[dict]:
-    """Calculate expense totals grouped by category."""
-    filter_start, filter_end = resolve_date_range(date_filter)
-
-    if start_date:
-        filter_start = date.fromisoformat(start_date)
-
-    if end_date:
-        filter_end = date.fromisoformat(end_date)
+    filter_start, filter_end = get_date_bounds(
+        date_filter, start_date, end_date
+    )
 
     with SessionLocal() as session:
         statement = (
@@ -370,20 +436,17 @@ def get_category_summary(
                 func.sum(Transaction.amount).label("total"),
                 func.count(Transaction.id).label("count"),
             )
-            .where(Transaction.type == "expense")
+            .where(
+                Transaction.user_id == user_id,
+                Transaction.type == "expense",
+            )
             .group_by(Transaction.category)
             .order_by(func.sum(Transaction.amount).desc())
         )
 
-        if filter_start:
-            statement = statement.where(
-                Transaction.transaction_date >= filter_start
-            )
-
-        if filter_end:
-            statement = statement.where(
-                Transaction.transaction_date <= filter_end
-            )
+        statement = apply_date_filters(
+            statement, filter_start, filter_end
+        )
 
         rows = session.execute(statement).all()
 
@@ -398,46 +461,45 @@ def get_category_summary(
 
 
 def compare_monthly_transactions(
+    user_id: int,
     transaction_type: str = "expense",
 ) -> dict:
-    """Compare this month's total with last month's total."""
     today = date.today()
-
     this_month_start = today.replace(day=1)
     last_month_end = this_month_start - timedelta(days=1)
     last_month_start = last_month_end.replace(day=1)
 
     with SessionLocal() as session:
-        statement = (
-            select(
-                func.sum(Transaction.amount),
-                func.count(Transaction.id),
-            )
-            .where(Transaction.type == transaction_type)
+        base_statement = select(
+            func.sum(Transaction.amount),
+            func.count(Transaction.id),
+        ).where(
+            Transaction.user_id == user_id,
+            Transaction.type == transaction_type,
         )
 
         current_total, current_count = session.execute(
-            statement.where(
+            base_statement.where(
                 Transaction.transaction_date >= this_month_start,
                 Transaction.transaction_date <= today,
             )
         ).one()
 
         previous_total, previous_count = session.execute(
-            statement.where(
+            base_statement.where(
                 Transaction.transaction_date >= last_month_start,
                 Transaction.transaction_date <= last_month_end,
             )
         ).one()
 
-        current_total = float(current_total or 0)
-        previous_total = float(previous_total or 0)
+        current_total = Decimal(str(current_total or 0))
+        previous_total = Decimal(str(previous_total or 0))
 
         difference = current_total - previous_total
 
         percentage_change = (
-            (difference / previous_total) * 100
-            if previous_total
+            difference / previous_total * Decimal("100")
+            if previous_total != 0
             else None
         )
 
@@ -446,15 +508,19 @@ def compare_monthly_transactions(
             "this_month": {
                 "start_date": this_month_start.isoformat(),
                 "end_date": today.isoformat(),
-                "total": current_total,
+                "total": float(current_total),
                 "count": current_count,
             },
             "last_month": {
                 "start_date": last_month_start.isoformat(),
                 "end_date": last_month_end.isoformat(),
-                "total": previous_total,
+                "total": float(previous_total),
                 "count": previous_count,
             },
-            "difference": difference,
-            "percentage_change": percentage_change,
+            "difference": float(difference),
+            "percentage_change": (
+                float(percentage_change)
+                if percentage_change is not None
+                else None
+            ),
         }
